@@ -1,0 +1,30 @@
+{
+  "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    // "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true,
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1,
+    },
+  },
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kenzo_backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "56e38408d1a749beba1f926ecc0c6d49",
+      "localConnectionString": "postgresql://lead_forge_app:1b9ce8a84a2a269896e4584fe5fec566dd61b060650e44954f94bb2a40855825@192.168.122.111:5432/lead_forge",
+    },
+  ],
+}
