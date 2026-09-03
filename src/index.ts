@@ -1,5 +1,3 @@
-// src/index.ts
-
 import { Hono } from "hono";
 
 import { Env } from "./types";

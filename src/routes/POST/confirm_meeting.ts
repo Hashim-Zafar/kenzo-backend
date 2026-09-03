@@ -1,11 +1,10 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import * as z from "zod";
-
-import { Env } from "../types";
-import { hashRawToken } from "../general_helpers";
-import { getZoomAccessToken, createZoomMeeting } from "../services/zoom";
-import { MEETING_CONFIG } from "../config_file";
+import { Env } from "../../types";
+import { hashRawToken } from "../../general_helpers";
+import { getZoomAccessToken, createZoomMeeting } from "../../services/zoom";
+import { MEETING_CONFIG } from "../../config_file";
 
 const confirmMeetingRouter = new Hono<Env>();
 
