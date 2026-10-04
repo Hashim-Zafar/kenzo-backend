@@ -3,229 +3,110 @@ import { zValidator } from "@hono/zod-validator";
 import * as z from "zod";
 
 import { Env } from "../../types";
-import { hashRawToken } from "../../general_helpers";
-import { getZoomAccessToken, createZoomMeeting } from "../../services/zoom";
+import { MEETING_CONFIG } from "../../config_file";
+import { generateHash, isBookableSlot } from "../../general_helpers";
+import { sendEmail } from "../../services/email";
+import { EmailTemplate } from "../../static";
+import { bookPendingMeeting, releasePendingMeeting } from "../../db_queries";
+import { REJECTIONS } from "../../errors";
 
-const confirmMeetingRouter = new Hono<Env>();
+const createMeetingRouter = new Hono<Env>();
 
-confirmMeetingRouter.post(
+createMeetingRouter.post(
   "/",
 
   zValidator(
     "json",
     z.object({
-      token: z.string().min(1),
+      lead_id: z.uuid(),
+      // Must carry an explicit offset or Z, e.g. 2026-10-05T10:00:00Z
+      start_time: z.iso.datetime({ offset: true }),
     }),
   ),
 
   async (c) => {
-    const { token } = c.req.valid("json");
-
+    const { lead_id: leadId, start_time } = c.req.valid("json");
     const db = c.var.db;
+    const schema = c.var.schema;
 
-    // ------------------------------------------------
-    // 1. Hash the raw confirmation token
-    // ------------------------------------------------
+    const startTime = new Date(start_time);
+    const endTime = new Date(
+      startTime.getTime() + MEETING_CONFIG.durationMinutes * 60_000,
+    );
 
-    const hashedToken = await hashRawToken(token);
+    // 1. Cheap checks first, all in code (no DB trip)
 
-    // ------------------------------------------------
-    // 2. Find the meeting associated with this token
-    // ------------------------------------------------
-
-    const [meeting] = await db`
-      SELECT
-        meeting_id,
-        start_time,
-        end_time,
-        meeting_status,
-        confirmation_token_expires_at
-      FROM meetings
-      WHERE confirmation_token_hash = ${hashedToken}
-      LIMIT 1
-    `;
-
-    // ------------------------------------------------
-    // 3. Invalid / already-used token
-    // ------------------------------------------------
-
-    if (!meeting) {
+    if (startTime.getTime() <= Date.now()) {
       return c.json(
-        {
-          success: false,
-          error: "Invalid or already used confirmation token",
-        },
+        { success: false, error: "Selected slot is in the past" },
         400,
       );
     }
 
-    // ------------------------------------------------
-    // 4. Meeting must still be awaiting confirmation
-    // ------------------------------------------------
-
-    if (meeting.meeting_status !== "pending_confirmation") {
+    if (!isBookableSlot(startTime)) {
       return c.json(
-        {
-          success: false,
-          error: "Meeting cannot be confirmed",
-        },
-        409,
+        { success: false, error: "Selected time is not a bookable slot" },
+        400,
       );
     }
 
-    // ------------------------------------------------
-    // 5. Make sure the confirmation token has not expired
-    // ------------------------------------------------
+    // 2. Book the slot (locking and race handling live in the query)
 
-    if (
-      !meeting.confirmation_token_expires_at ||
-      new Date(meeting.confirmation_token_expires_at) <= new Date()
-    ) {
-      return c.json(
-        {
-          success: false,
-          error: "Confirmation token has expired",
-        },
-        410,
-      );
-    }
+    const { rawToken, hashToken } = await generateHash();
 
-    // ------------------------------------------------
-    // 6. Normalize the stored meeting timestamps
-    // ------------------------------------------------
-
-    const startTime = new Date(meeting.start_time);
-
-    const endTime = new Date(meeting.end_time);
-
-    // ------------------------------------------------
-    // 7. Safety check against corrupted meeting times
-    // ------------------------------------------------
-
-    if (
-      Number.isNaN(startTime.getTime()) ||
-      Number.isNaN(endTime.getTime()) ||
-      endTime <= startTime
-    ) {
-      return c.json(
-        {
-          success: false,
-          error: "Meeting contains invalid scheduling data",
-        },
-        500,
-      );
-    }
-
-    // Zoom expects duration in minutes
-    const durationMinutes = Math.round(
-      (endTime.getTime() - startTime.getTime()) / 60_000,
-    );
-
-    // ------------------------------------------------
-    // 8. Get temporary Zoom OAuth access token
-    // ------------------------------------------------
-
-    const accessToken = await getZoomAccessToken(c.env);
-
-    // ------------------------------------------------
-    // 9. Create the actual Zoom meeting
-    // ------------------------------------------------
-
-    const { zoomMeetingId, meetingLink } = await createZoomMeeting({
-      accessToken,
-
-      hostUserId: c.env.ZOOM_HOST_USER_ID,
-
-      startTime: startTime.toISOString(),
-
-      durationMinutes,
+    const row = await bookPendingMeeting(db, {
+      schema,
+      leadId,
+      startTime,
+      endTime,
+      hashToken,
     });
 
-    // ------------------------------------------------
-    // 10. Update our meeting record
-    // ------------------------------------------------
-
-    const [confirmedMeeting] = await db`
-      UPDATE meetings
-
-      SET
-        zoom_meeting_id =
-          ${zoomMeetingId},
-
-        meeting_link =
-          ${meetingLink},
-
-        meeting_status =
-          'confirmed',
-
-        confirmed_at =
-          NOW(),
-
-        confirmation_token_hash =
-          NULL,
-
-        confirmation_token_expires_at =
-          NULL,
-
-        updated_at =
-          NOW()
-
-      WHERE
-        meeting_id =
-          ${meeting.meeting_id}
-
-        AND meeting_status =
-          'pending_confirmation'
-
-      RETURNING
-        meeting_id,
-        zoom_meeting_id,
-        meeting_link,
-        start_time,
-        end_time,
-        meeting_status,
-        confirmed_at
-    `;
-
-    // ------------------------------------------------
-    // 11. Defensive guard
-    // ------------------------------------------------
-
-    if (!confirmedMeeting) {
+    if (!row || row.reason !== "ok") {
+      const rejection =
+        REJECTIONS[
+          (row?.reason ?? "lead_not_found") as keyof typeof REJECTIONS
+        ];
       return c.json(
-        {
-          success: false,
-          error: "Meeting could not be confirmed",
-        },
-        409,
+        { success: false, error: rejection.error },
+        rejection.status,
       );
     }
 
-    // ------------------------------------------------
-    // 12. Return confirmed meeting
-    // ------------------------------------------------
+    // 3. Send the confirmation email (after COMMIT, so no lock is held during a network call)
+
+    const emailResult = await sendEmail({
+      to: row.email!,
+      subject: "Confirm your booking",
+      html: EmailTemplate(row.name!, c.env.FRONTEND_DOMAIN, rawToken),
+      env: c.env,
+    });
+
+    // The lead can't confirm without the email, so don't keep the slot held.
+    // This extra trip only happens on the failure path.
+    if (!emailResult.success) {
+      await releasePendingMeeting(db, schema, row.meeting_id!);
+
+      return c.json(
+        { success: false, error: "Could not send confirmation email" },
+        502,
+      );
+    }
 
     return c.json(
       {
         success: true,
-
         meeting: {
-          meeting_id: confirmedMeeting.meeting_id,
-
-          meeting_link: confirmedMeeting.meeting_link,
-
-          start_time: confirmedMeeting.start_time,
-
-          end_time: confirmedMeeting.end_time,
-
-          meeting_status: confirmedMeeting.meeting_status,
-
-          confirmed_at: confirmedMeeting.confirmed_at,
+          meeting_id: row.meeting_id,
+          start_time: row.start_time,
+          end_time: row.end_time,
+          meeting_status: "pending_confirmation",
+          confirmation_expires_at: row.confirmation_token_expires_at,
         },
       },
-      200,
+      201,
     );
   },
 );
 
-export default confirmMeetingRouter;
+export default createMeetingRouter;

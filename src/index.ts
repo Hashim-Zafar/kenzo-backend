@@ -2,6 +2,7 @@ import { Hono } from "hono";
 
 import { Env } from "./types";
 import { databaseMiddleware } from "./middlewares/database";
+import { schemaMiddleware } from "./middlewares/schema";
 import postRouter from "./routes/POST/create_meeting";
 import zoomwebhookRouter from "./routes/WEBHOOKS/zoom_webhook";
 import confirmMeetingRouter from "./routes/POST/confirm_meeting";
@@ -11,6 +12,7 @@ const app = new Hono<Env>();
 
 // global middleware
 app.use("*", databaseMiddleware);
+app.use("*", schemaMiddleware);
 
 // routes
 app.route("/create-meeting", postRouter);
